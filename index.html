@@ -1459,7 +1459,201 @@ async function showRoute(v){
    document.getElementById("routeNote").textContent="ルートを自動消去しました。車両を選択すると再表示できます。";
  },30000);
 }
+function renderHistoryPrediction(){
+  const box=document.getElementById("nextOperations");
+  const input=document.getElementById("recordWorkNo");
+  if(!box||!input)return;
 
+  const workNo=input.value.trim();
+  if(!workNo){
+    box.style.display="none";
+    return;
+  }
+
+  const records=historyRecords.filter(r=>
+    String(r.workNo||r.terminalNo||"")===workNo
+  );
+
+  if(!records.length){
+    box.style.display="block";
+    box.innerHTML="<b>🔮 次運用予測</b><div class='schedule-empty'>この車両の運用記録がまだありません。</div>";
+    return;
+  }
+
+  // 最新の運用記録を現在位置として使用
+  const current=records
+    .slice()
+    .sort((a,b)=>scheduleTimeToSeconds(b.time)-scheduleTimeToSeconds(a.time))[0];
+
+  const dayType=getOperationDayType(current.date);
+  const rows=[];
+
+  // 曜日区分の基準データ
+  for(const v of DAILY_REFERENCE_DATA){
+    if(v.dayType!==dayType)continue;
+    for(const r of (v.records||[])){
+      rows.push({
+        workNo:String(v.workNo),
+        time:String(r.time),
+        route:String(r.route||"?"),
+        destination:String(r.destination||"?")
+      });
+    }
+  }
+
+  // 当日の実績も追加
+  for(const r of historyRecords){
+    if(String(r.date)===String(current.date) &&
+       getOperationDayType(r.date)===dayType){
+      rows.push({
+        workNo:String(r.workNo||r.terminalNo||"?"),
+        time:String(r.time),
+        route:String(r.route||"?"),
+        destination:String(r.destination||"?")
+      });
+    }
+  }
+
+  const curSec=scheduleTimeToSeconds(current.time);
+  if(curSec===null){
+    box.style.display="block";
+    box.innerHTML="<b>🔮 次運用予測</b><div class='schedule-empty'>時刻を取得できないため予測できません。</div>";
+    return;
+  }
+
+  const norm=s=>String(s||"").replace(/\s+/g,"").trim();
+
+  const matches=[];
+
+  for(const r of rows){
+    const rs=scheduleTimeToSeconds(r.time);
+    if(rs===null)continue;
+
+    const routeMatch=norm(r.route)===norm(current.route);
+    const destMatch=norm(r.destination)===norm(current.destination);
+
+    if(!routeMatch || !destMatch)continue;
+
+    // 同じ車両の過去運用から「次に何へ行ったか」を取得
+    const vehicleRows=rows
+      .filter(x=>String(x.workNo)===String(r.workNo))
+      .map(x=>({...x,sec:scheduleTimeToSeconds(x.time)}))
+      .filter(x=>x.sec!==null)
+      .sort((a,b)=>a.sec-b.sec);
+
+    const idx=vehicleRows.findIndex(x=>
+      x.time===r.time &&
+      x.route===r.route &&
+      x.destination===r.destination
+    );
+
+    if(idx<0)continue;
+
+    for(let j=1;j<=3;j++){
+      const next=vehicleRows[idx+j];
+      if(!next)continue;
+
+      let delta=next.sec-rs;
+      if(delta<=0)delta+=86400;
+
+      // 5分未満・8時間超は異常値として除外
+      if(delta<300 || delta>28800)continue;
+
+      matches.push({
+        next,
+        delta,
+        sourceVehicle:r.workNo
+      });
+    }
+  }
+
+  const groups=new Map();
+
+  for(const m of matches){
+    const key=norm(m.next.route)+"||"+norm(m.next.destination);
+
+    if(!groups.has(key)){
+      groups.set(key,{
+        route:m.next.route,
+        destination:m.next.destination,
+        items:[]
+      });
+    }
+
+    groups.get(key).items.push(m);
+  }
+
+  const candidates=[...groups.values()].map(g=>{
+    const count=g.items.length;
+    const vehicles=new Set(g.items.map(x=>x.sourceVehicle)).size;
+
+    const avgDelta=
+      g.items.reduce((s,x)=>s+x.delta,0)/Math.max(count,1);
+
+    const confidence=Math.min(
+      99,
+      40+
+      Math.min(30,count*5)+
+      Math.min(20,vehicles*4)
+    );
+
+    return {...g,count,vehicles,avgDelta,confidence};
+  }).sort((a,b)=>
+    b.confidence-a.confidence ||
+    b.count-a.count
+  );
+
+  box.style.display="block";
+
+  if(!candidates.length){
+    box.innerHTML=
+      `<b>🔮 次運用予測</b>
+       <div class="schedule-empty">
+       ${esc(dayType)}の過去データから一致する運用が見つかりません。
+       </div>`;
+    return;
+  }
+
+  const predicted=candidates.slice(0,5).map((c,i)=>{
+    const sec=curSec+c.avgDelta;
+    const d=new Date();
+    d.setHours(0,0,0,0);
+    d.setSeconds(sec%86400);
+
+    const hh=String(d.getHours()).padStart(2,"0");
+    const mm=String(d.getMinutes()).padStart(2,"0");
+
+    return `
+      <div class="schedule-row">
+        <div class="schedule-time">${hh}:${mm}頃</div>
+        <div>
+          <div class="schedule-route">
+            ${i===0?"⭐ ":""}${esc(c.route)}
+          </div>
+          <div class="schedule-dest">
+            → ${esc(c.destination)}
+          </div>
+          <div class="schedule-note">
+            ${i===0?"最有力・":""}
+            過去一致 ${c.count}件・${c.vehicles}台
+            ・信頼度 ${c.confidence}%
+          </div>
+        </div>
+      </div>`;
+  }).join("");
+
+  box.innerHTML=`
+    <b>🔮 次運用予測</b>
+    <div class="schedule-note">
+      ${esc(dayType)}・最新記録 ${esc(current.time)}
+      ${esc(current.route)} → ${esc(current.destination)}
+    </div>
+    ${predicted}
+    <div class="schedule-note" style="margin-top:8px">
+      過去の同じ路線・行先から、その後に続いた運用を比較して予測しています。
+      車両番号だけでなく、複数車両の共通パターンも評価します。
+    </div>`;
+}
 function openHistoryForVehicle(v){
  const panel=document.getElementById("historyPanel");
  const input=document.getElementById("recordWorkNo");
@@ -1687,7 +1881,7 @@ document.getElementById("recordWorkNo").addEventListener("input",()=>{
   syncHistoryFilter();
 
 
-  renderNextOperations();
+  renderHistoryPrediction();
 });
 
 document.getElementById("closeHistory").addEventListener("click",()=>{
